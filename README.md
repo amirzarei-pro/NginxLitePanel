@@ -70,7 +70,7 @@ nginx-lite-panel/
 ## 1) Clone the repository
 
 ```bash
-git clone https://github.com/<YOUR_USERNAME>/nginx-lite-panel.git
+git clone https://github.com/amirzarei-pro/nginx-lite-panel.git
 cd nginx-lite-panel
 ```
 
@@ -263,7 +263,7 @@ nginx-lite-panel/
 ## ۱) کلون کردن پروژه
 
 ```bash
-git clone https://github.com/<YOUR_USERNAME>/nginx-lite-panel.git
+git clone https://github.com/amirzarei-pro/nginx-lite-panel.git
 cd nginx-lite-panel
 ```
 

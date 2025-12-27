@@ -261,8 +261,8 @@ nginx-lite-panel/
 ## ۱) کلون کردن پروژه
 
 ```bash
-git clone https://github.com/amirzarei-pro/nginx-lite-panel.git
-cd nginx-lite-panel
+git clone https://github.com/amirzarei-pro/NginxLitePanel.git
+cd NginxLitePanel
 ```
 
 ## ۲) نصب وابستگی‌ها
@@ -340,8 +340,6 @@ ExecStart=/usr/bin/node /opt/nginx-panel/app.js
 Restart=always
 Environment=NODE_ENV=production
 EnvironmentFile=/opt/nginx-panel/.env
-User=www-data
-Group=www-data
 
 [Install]
 WantedBy=multi-user.target

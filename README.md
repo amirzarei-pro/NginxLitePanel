@@ -70,8 +70,8 @@ nginx-lite-panel/
 ## 1) Clone the repository
 
 ```bash
-git clone https://github.com/amirzarei-pro/nginx-lite-panel.git
-cd nginx-lite-panel
+git clone https://github.com/amirzarei-pro/NginxLitePanel.git
+cd NginxLitePanel
 ```
 
 ## 2) Install dependencies

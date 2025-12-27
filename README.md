@@ -150,8 +150,6 @@ ExecStart=/usr/bin/node /opt/nginx-panel/app.js
 Restart=always
 Environment=NODE_ENV=production
 EnvironmentFile=/opt/nginx-panel/.env
-User=www-data
-Group=www-data
 
 [Install]
 WantedBy=multi-user.target

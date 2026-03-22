@@ -16,6 +16,7 @@ const NGINX_ENABLED_DIR = process.env.NGINX_ENABLED_DIR || '/etc/nginx/sites-ena
 const NGINX_PATH = process.env.NGINX_PATH || '/usr/sbin/nginx';
 const USE_SYSTEMCTL = (process.env.USE_SYSTEMCTL || 'false').toLowerCase() === 'true';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'change_this_secret';
+const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || 'nginxpanel.sid';
 const PORT = parseInt(process.env.PORT || '5005', 10);
 
 // ===== check =====
@@ -24,7 +25,18 @@ if (!PANEL_PASSWORD_HASH) {
     process.exit(1);
 }
 
+// ===== paths =====
+const DATA_DIR = path.join(__dirname, 'data');
+const HISTORY_DIR = path.join(DATA_DIR, 'history');
+const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const TEMPLATES_FILE = path.join(DATA_DIR, 'templates.json');
+
 // ===== helpers =====
+function ensureDir(p) {
+    fs.mkdirSync(p, { recursive: true });
+}
+
 function isValidSiteName(name) {
     return /^[a-zA-Z0-9._-]+$/.test(name);
 }
@@ -52,20 +64,50 @@ function runCommand(command, args) {
     });
 }
 
-const DATA_DIR = path.join(__dirname, 'data');
-const HISTORY_DIR = path.join(DATA_DIR, 'history');
-const BACKUP_DIR = path.join(DATA_DIR, 'backups');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const TEMPLATES_FILE = path.join(DATA_DIR, 'templates.json');
-
-function ensureDir(p) {
-    fs.mkdirSync(p, { recursive: true });
-}
-
 function getClientIp(req) {
     return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
         req.socket.remoteAddress ||
         'unknown';
+}
+
+function loadTemplates() {
+    if (!fs.existsSync(TEMPLATES_FILE)) return [];
+    try {
+        return JSON.parse(fs.readFileSync(TEMPLATES_FILE, 'utf8'));
+    } catch (_) {
+        return [];
+    }
+}
+
+function loadUsers() {
+    if (!fs.existsSync(USERS_FILE)) return [];
+    try {
+        return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+    } catch (e) {
+        console.error('Failed to read users.json', e);
+        return [];
+    }
+}
+
+function saveUsers(users) {
+    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
+}
+
+function bootstrapAdminUserIfNeeded() {
+    let users = loadUsers();
+
+    if (users.length === 0 && PANEL_USERNAME && PANEL_PASSWORD_HASH) {
+        users = [
+            {
+                username: PANEL_USERNAME,
+                passwordHash: PANEL_PASSWORD_HASH,
+                role: 'admin'
+            }
+        ];
+        saveUsers(users);
+    }
+
+    return users;
 }
 
 function saveVersion(siteName, oldContent, user, ip) {
@@ -81,34 +123,40 @@ function saveVersion(siteName, oldContent, user, ip) {
 
     const indexFile = path.join(siteHistoryDir, 'index.json');
     let index = [];
+
     if (fs.existsSync(indexFile)) {
         try {
             index = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
-        } catch (_) { }
+        } catch (_) {
+            index = [];
+        }
     }
+
     index.unshift({
         id: versionId,
         createdAt: ts,
         user: user || 'unknown',
         ip: ip || 'unknown'
     });
+
     fs.writeFileSync(indexFile, JSON.stringify(index, null, 2), 'utf8');
 }
 
 function createBackup() {
     ensureDir(BACKUP_DIR);
+
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
     const fileName = `${ts}_nginx-backup.tar.gz`;
     const fullPath = path.join(BACKUP_DIR, fileName);
 
     return new Promise((resolve, reject) => {
-        // tar از nginx config و data panel
         const args = [
             '-czf',
             fullPath,
             '/etc/nginx',
             DATA_DIR
         ];
+
         execFile('tar', args, (error, stdout, stderr) => {
             if (error) {
                 console.error('Backup error:', error, stderr.toString());
@@ -119,58 +167,82 @@ function createBackup() {
     });
 }
 
-function loadTemplates() {
-    if (!fs.existsSync(TEMPLATES_FILE)) return [];
-    try {
-        const raw = fs.readFileSync(TEMPLATES_FILE, 'utf8');
-        return JSON.parse(raw);
-    } catch (_) {
-        return [];
+function getLogPath(type) {
+    if (type === 'error') return '/var/log/nginx/error.log';
+    return '/var/log/nginx/access.log';
+}
+
+function isApiRequest(req) {
+    return req.path.startsWith('/api/');
+}
+
+function sendUnauthorized(req, res) {
+    if (isApiRequest(req)) {
+        return res.status(401).json({
+            ok: false,
+            error: 'AUTH_REQUIRED',
+            message: 'Authentication required.',
+            loginUrl: '/login'
+        });
     }
+
+    return res.redirect('/login');
 }
 
-function loadUsers() {
-    if (!fs.existsSync(USERS_FILE)) return [];
-    try {
-        const raw = fs.readFileSync(USERS_FILE, 'utf8');
-        return JSON.parse(raw);
-    } catch (e) {
-        console.error('Failed to read users.json', e);
-        return [];
+function sendForbidden(req, res) {
+    if (isApiRequest(req)) {
+        return res.status(403).json({
+            ok: false,
+            error: 'FORBIDDEN',
+            message: 'Insufficient permissions.'
+        });
     }
-}
 
-function saveUsers(users) {
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf8');
+    return res.status(403).send('Forbidden: insufficient permissions.');
 }
-
-function findUser(username) {
-    const users = loadUsers();
-    return users.find(u => u.username === username);
-}
-
 
 // ===== app =====
 const app = express();
+
+/*
+ * Trust the reverse proxy.
+ * Needed for Cloudflare Flexible + nginx forwarded headers.
+ */
+app.set('trust proxy', 1);
 
 // if needed, enable helmet with custom CSP
 // app.use(helmet());
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+app.use(express.text({ type: ['text/plain', 'application/nginx-conf'] }));
 
-// static CSS/JS
+// Static CSS/JS
 app.use('/static', express.static(path.join(__dirname, 'static')));
 
+// Disable caching for auth-sensitive pages and API responses
+app.use((req, res, next) => {
+    if (req.path === '/login' || req.path === '/' || req.path.startsWith('/api/')) {
+        res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+        res.set('Pragma', 'no-cache');
+        res.set('Expires', '0');
+    }
+    next();
+});
+
 app.use(session({
-    name: 'nginxpanel.sid',
+    name: SESSION_COOKIE_NAME,
     secret: SESSION_SECRET,
+    proxy: true,
     resave: false,
     saveUninitialized: false,
+    rolling: true,
+    unset: 'destroy',
     cookie: {
         httpOnly: true,
         sameSite: 'lax',
-        secure: false // if behind HTTPS proxy, set to true
+        secure: 'auto',
+        maxAge: 12 * 60 * 60 * 1000
     }
 }));
 
@@ -179,30 +251,33 @@ function requireAuth(req, res, next) {
     if (req.session && req.session.authenticated === true) {
         return next();
     }
-    res.redirect('/login');
+    return sendUnauthorized(req, res);
 }
+
 function requireRole(requiredRole) {
     return function (req, res, next) {
-        if (!req.session || !req.session.authenticated) {
-            return res.redirect('/login');
+        if (!req.session || req.session.authenticated !== true) {
+            return sendUnauthorized(req, res);
         }
+
         const role = req.session.role;
         const levels = { viewer: 1, operator: 2, admin: 3 };
         const need = levels[requiredRole] || 99;
         const have = levels[role] || 0;
+
         if (have < need) {
-            return res.status(403).send('Forbidden: insufficient permissions.');
+            return sendForbidden(req, res);
         }
-        next();
+
+        return next();
     };
 }
 
-
 // ===== pages =====
 
-// login
+// Login page
 app.get('/login', (req, res) => {
-    if (req.session && req.session.authenticated) {
+    if (req.session && req.session.authenticated === true) {
         return res.redirect('/');
     }
 
@@ -231,31 +306,20 @@ app.get('/login', (req, res) => {
 </body>
 </html>
 `;
-    res.send(html);
+    return res.send(html);
 });
 
-// login
+// Login submit
 app.post('/login', async (req, res) => {
     const { username, password } = req.body || {};
+
     if (!username || !password) {
         return res.redirect('/login?error=1');
     }
 
-    let users = loadUsers();
-
-    // اگر هیچ یوزری نیست، از .env یه admin بساز (bootstrap)
-    if (users.length === 0 && PANEL_USERNAME && PANEL_PASSWORD_HASH) {
-        users = [
-            {
-                username: PANEL_USERNAME,
-                passwordHash: PANEL_PASSWORD_HASH,
-                role: 'admin'
-            }
-        ];
-        saveUsers(users);
-    }
-
+    const users = bootstrapAdminUserIfNeeded();
     const user = users.find(u => u.username === username);
+
     if (!user) {
         return res.redirect('/login?error=1');
     }
@@ -265,22 +329,40 @@ app.post('/login', async (req, res) => {
         return res.redirect('/login?error=1');
     }
 
-    req.session.authenticated = true;
-    req.session.username = user.username;
-    req.session.role = user.role;
+    req.session.regenerate((regenErr) => {
+        if (regenErr) {
+            console.error('Session regenerate failed:', regenErr);
+            return res.status(500).send('Failed to create session.');
+        }
 
-    res.redirect('/');
-});
+        req.session.authenticated = true;
+        req.session.username = user.username;
+        req.session.role = user.role;
 
+        req.session.save((saveErr) => {
+            if (saveErr) {
+                console.error('Session save failed:', saveErr);
+                return res.status(500).send('Failed to persist session.');
+            }
 
-// logout
-app.post('/logout', requireAuth, (req, res) => {
-    req.session.destroy(() => {
-        res.redirect('/login');
+            return res.redirect('/');
+        });
     });
 });
 
-// main page
+// Logout
+app.post('/logout', requireAuth, (req, res) => {
+    req.session.destroy((err) => {
+        if (err) {
+            console.error('Session destroy failed:', err);
+        }
+
+        res.clearCookie(SESSION_COOKIE_NAME);
+        return res.redirect('/login');
+    });
+});
+
+// Main page
 app.get('/', requireAuth, (req, res) => {
     const html = `
   <!doctype html>
@@ -302,7 +384,6 @@ app.get('/', requireAuth, (req, res) => {
     </header>
   
     <main class="app-main">
-      <!-- Sidebar navigation -->
       <aside id="sidebar">
         <nav class="sidebar-nav">
           <button data-section="sites" class="nav-item nav-item-active">Sites</button>
@@ -329,9 +410,7 @@ app.get('/', requireAuth, (req, res) => {
         </section>
       </aside>
   
-      <!-- Content area -->
       <section id="content">
-        <!-- Section: Sites -->
         <section id="section-sites" class="content-section content-section-active">
           <div id="editor-header">
             <div id="filename">(no file selected)</div>
@@ -349,7 +428,6 @@ app.get('/', requireAuth, (req, res) => {
           </div>
         </section>
   
-        <!-- Section: Logs -->
         <section id="section-logs" class="content-section">
           <div class="section-header">
             <h2>Logs</h2>
@@ -375,7 +453,6 @@ app.get('/', requireAuth, (req, res) => {
           <textarea id="logs-output" class="logs-output" readonly></textarea>
         </section>
   
-        <!-- Section: Backups -->
         <section id="section-backups" class="content-section">
           <div class="section-header">
             <h2>Backups</h2>
@@ -385,7 +462,6 @@ app.get('/', requireAuth, (req, res) => {
           <ul id="backup-list" class="backup-list"></ul>
         </section>
   
-        <!-- Section: Templates -->
         <section id="section-templates" class="content-section">
           <div class="section-header">
             <h2>Templates</h2>
@@ -397,7 +473,6 @@ app.get('/', requireAuth, (req, res) => {
       </section>
     </main>
   
-    <!-- Version modal -->
     <div id="versions-modal" class="modal hidden">
       <div class="modal-backdrop"></div>
       <div class="modal-dialog">
@@ -425,122 +500,133 @@ app.get('/', requireAuth, (req, res) => {
   </body>
   </html>
   `;
-    res.send(html);
+    return res.send(html);
 });
-
 
 // ===== API =====
 
-// site list
+// Site list
 app.get('/api/sites', requireAuth, (req, res) => {
     fs.readdir(NGINX_AVAILABLE_DIR, (err, files) => {
         if (err) {
             return res.status(500).json({ error: 'Failed to read directory.' });
         }
+
         const result = files
             .filter(f => isValidSiteName(f))
             .map(name => {
                 const availablePath = getAvailablePath(name);
                 const enabledPath = getEnabledPath(name);
                 let enabled = false;
+
                 try {
                     const st = fs.lstatSync(enabledPath);
                     if (st.isSymbolicLink()) enabled = true;
                 } catch (_) { }
+
                 return { name, enabled, path: availablePath };
             });
-        res.json(result);
+
+        return res.json(result);
     });
 });
 
-// content
+// Site content
 app.get('/api/sites/:name', requireAuth, (req, res) => {
     const name = req.params.name;
     const filePath = getAvailablePath(name);
-    if (!filePath) return res.status(400).send('Invalid name');
+
+    if (!filePath) {
+        return res.status(400).send('Invalid name');
+    }
+
     fs.readFile(filePath, 'utf8', (err, data) => {
         if (err) return res.status(404).send('File not found');
-        res.type('text/plain').send(data);
+        return res.type('text/plain').send(data);
     });
 });
 
-// meta (enabled/disabled)
+// Site meta
 app.get('/api/sites/:name/meta', requireAuth, (req, res) => {
     const name = req.params.name;
-    if (!isValidSiteName(name)) return res.status(400).json({ error: 'Invalid name' });
+
+    if (!isValidSiteName(name)) {
+        return res.status(400).json({ error: 'Invalid name' });
+    }
+
     const enabledPath = getEnabledPath(name);
     let enabled = false;
+
     try {
         const st = fs.lstatSync(enabledPath);
         if (st.isSymbolicLink()) enabled = true;
     } catch (_) { }
-    res.json({ name, enabled });
+
+    return res.json({ name, enabled });
 });
 
-// save
+// Save site
 app.put('/api/sites/:name', requireRole('operator'), async (req, res) => {
     const name = req.params.name;
     const filePath = getAvailablePath(name);
-    if (!filePath) return res.status(400).send('Invalid name');
 
-    let body = '';
-    req.setEncoding('utf8');
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', async () => {
-        let oldContent = '';
+    if (!filePath) {
+        return res.status(400).send('Invalid name');
+    }
+
+    const body = typeof req.body === 'string' ? req.body : '';
+
+    let oldContent = '';
+    try {
+        if (fs.existsSync(filePath)) {
+            oldContent = fs.readFileSync(filePath, 'utf8');
+        }
+    } catch (_) {
+        oldContent = '';
+    }
+
+    saveVersion(
+        name,
+        oldContent,
+        req.session?.username || PANEL_USERNAME,
+        getClientIp(req)
+    );
+
+    try {
+        fs.writeFileSync(filePath, body, 'utf8');
+    } catch (err) {
+        console.error(err);
+        return res.status(500).send('Failed to write file.');
+    }
+
+    const testResult = await runCommand(NGINX_PATH, ['-t']);
+    if (testResult.exitCode !== 0) {
         try {
-            if (fs.existsSync(filePath)) {
-                oldContent = fs.readFileSync(filePath, 'utf8');
-            }
-        } catch (_) { }
-
-        // نسخه قبلی رو ذخیره کن
-        saveVersion(
-            name,
-            oldContent,
-            req.session?.username || PANEL_USERNAME,
-            getClientIp(req)
-        );
-
-        // فایل جدید رو بنویس
-        try {
-            fs.writeFileSync(filePath, body, 'utf8');
-        } catch (err) {
-            console.error(err);
-            return res.status(500).send('Failed to write file.');
+            fs.writeFileSync(filePath, oldContent || '', 'utf8');
+        } catch (rollbackErr) {
+            console.error('Rollback failed:', rollbackErr);
         }
 
-        // حالا nginx -t
-        const testResult = await runCommand(NGINX_PATH, ['-t']);
-        if (testResult.exitCode !== 0) {
-            // اگر تست fail شد، rollback کن
-            try {
-                fs.writeFileSync(filePath, oldContent || '', 'utf8');
-            } catch (e) {
-                console.error('Rollback failed:', e);
-            }
-            return res
-                .status(400)
-                .type('text/plain')
-                .send(
-                    'nginx -t failed. Changes reverted.\n\n' +
-                    `STDOUT:\n${testResult.stdout}\n\nSTDERR:\n${testResult.stderr}`
-                );
-        }
+        return res
+            .status(400)
+            .type('text/plain')
+            .send(
+                'nginx -t failed. Changes reverted.\n\n' +
+                `STDOUT:\n${testResult.stdout}\n\nSTDERR:\n${testResult.stderr}`
+            );
+    }
 
-        // OK
-        res.send('Saved and nginx -t OK.');
-    });
+    return res.send('Saved and nginx -t OK.');
 });
 
-
-
-// create new site
+// Create new site
 app.post('/api/sites', requireAuth, (req, res) => {
     const { name, templateId } = req.body || {};
+
     if (typeof name !== 'string' || !isValidSiteName(name)) {
         return res.status(400).send('Invalid site name.');
     }
+
     const filePath = getAvailablePath(name);
     if (fs.existsSync(filePath)) {
         return res.status(400).send('File already exists.');
@@ -548,167 +634,196 @@ app.post('/api/sites', requireAuth, (req, res) => {
 
     const templates = loadTemplates();
     let content = '';
+
     if (templateId) {
         const tpl = templates.find(t => t.id === templateId);
         if (tpl) {
             content = tpl.content.replace(/{{domain}}/g, name);
         }
     }
+
     if (!content) {
         content = `server {
-      listen 80;
-      server_name ${name};
-  
-      root /var/www/${name};
-      index index.html;
-  
-      location / {
-          try_files $uri $uri/ =404;
-      }
-  }
-  `;
+    listen 80;
+    server_name ${name};
+
+    root /var/www/${name};
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+`;
     }
 
-    fs.writeFile(filePath, content, 'utf8', err => {
+    fs.writeFile(filePath, content, 'utf8', (err) => {
         if (err) return res.status(500).send('Failed to create file.');
-        res.send('Site created: ' + name);
+        return res.send('Site created: ' + name);
     });
 });
 
-
-// enable
+// Enable site
 app.post('/api/sites/:name/enable', requireRole('admin'), (req, res) => {
     const name = req.params.name;
     const src = getAvailablePath(name);
     const dest = getEnabledPath(name);
-    if (!src || !dest) return res.status(400).send('Invalid name');
 
-    if (!fs.existsSync(src)) return res.status(404).send('Source file not found.');
+    if (!src || !dest) {
+        return res.status(400).send('Invalid name');
+    }
+
+    if (!fs.existsSync(src)) {
+        return res.status(404).send('Source file not found.');
+    }
 
     try {
         if (fs.existsSync(dest)) {
             return res.status(400).send('Site already enabled.');
         }
+
         fs.symlinkSync(src, dest);
-        res.send('Site enabled.');
+        return res.send('Site enabled.');
     } catch (err) {
         console.error(err);
-        res.status(500).send('Failed to enable site.');
+        return res.status(500).send('Failed to enable site.');
     }
 });
 
-// disable
+// Disable site
 app.post('/api/sites/:name/disable', requireRole('admin'), (req, res) => {
     const name = req.params.name;
     const dest = getEnabledPath(name);
-    if (!dest) return res.status(400).send('Invalid name');
+
+    if (!dest) {
+        return res.status(400).send('Invalid name');
+    }
+
     try {
         if (!fs.existsSync(dest)) {
             return res.status(400).send('Site not enabled.');
         }
+
         fs.unlinkSync(dest);
-        res.send('Site disabled.');
+        return res.send('Site disabled.');
     } catch (err) {
         console.error(err);
-        res.status(500).send('Failed to disable site.');
+        return res.status(500).send('Failed to disable site.');
     }
 });
 
-// test nginx
+// Test nginx
 app.post('/api/nginx/test', requireAuth, async (req, res) => {
     const result = await runCommand(NGINX_PATH, ['-t']);
-    res.type('text/plain').send(`ExitCode: ${result.exitCode}\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`);
+    return res
+        .type('text/plain')
+        .send(`ExitCode: ${result.exitCode}\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`);
 });
 
-// reload nginx
+// Reload nginx
 app.post('/api/nginx/reload', requireRole('admin'), async (req, res) => {
     let result;
+
     if (USE_SYSTEMCTL) {
         result = await runCommand('/bin/systemctl', ['reload', 'nginx']);
     } else {
         result = await runCommand(NGINX_PATH, ['-s', 'reload']);
     }
-    res.type('text/plain').send(`ExitCode: ${result.exitCode}\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`);
+
+    return res
+        .type('text/plain')
+        .send(`ExitCode: ${result.exitCode}\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`);
 });
 
-// لیست نسخه‌های یک سایت
+// List site versions
 app.get('/api/sites/:name/versions', requireAuth, (req, res) => {
     const name = req.params.name;
-    if (!isValidSiteName(name)) return res.status(400).send('Invalid name');
+
+    if (!isValidSiteName(name)) {
+        return res.status(400).send('Invalid name');
+    }
 
     const siteHistoryDir = path.join(HISTORY_DIR, name);
     const indexFile = path.join(siteHistoryDir, 'index.json');
+
     if (!fs.existsSync(indexFile)) {
         return res.json([]);
     }
+
     try {
         const index = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
-        res.json(index);
+        return res.json(index);
     } catch (err) {
         console.error(err);
-        res.status(500).send('Failed to read history.');
+        return res.status(500).send('Failed to read history.');
     }
 });
 
-// دریافت محتوای یک نسخه خاص
+// Get version content
 app.get('/api/sites/:name/versions/:versionId', requireAuth, (req, res) => {
     const name = req.params.name;
     const versionId = req.params.versionId;
-    if (!isValidSiteName(name)) return res.status(400).send('Invalid name');
+
+    if (!isValidSiteName(name)) {
+        return res.status(400).send('Invalid name');
+    }
 
     const siteHistoryDir = path.join(HISTORY_DIR, name);
     const versionFile = path.join(siteHistoryDir, `${versionId}.conf`);
+
     if (!fs.existsSync(versionFile)) {
         return res.status(404).send('Version not found');
     }
+
     const content = fs.readFileSync(versionFile, 'utf8');
-    res.type('text/plain').send(content);
+    return res.type('text/plain').send(content);
 });
 
-// ساخت بکاپ
+// Create backup
 app.post('/api/backup', requireRole('admin'), async (req, res) => {
-    // بعداً با Roles می‌گیم فقط admin
     try {
         const result = await createBackup();
-        res.json({ ok: true, file: result.fileName });
+        return res.json({ ok: true, file: result.fileName });
     } catch (err) {
-        res.status(500).type('text/plain').send('Backup failed:\n' + err);
+        return res.status(500).type('text/plain').send('Backup failed:\n' + err);
     }
 });
 
-// لیست بکاپ‌ها
+// List backups
 app.get('/api/backup', requireRole('admin'), (req, res) => {
     ensureDir(BACKUP_DIR);
+
     const files = fs.readdirSync(BACKUP_DIR)
         .filter(f => f.endsWith('.tar.gz'))
         .sort()
         .reverse();
-    res.json(files);
+
+    return res.json(files);
 });
 
-// دانلود بکاپ
+// Download backup
 app.get('/api/backup/:name', requireRole('admin'), (req, res) => {
     const name = req.params.name;
+
     if (!/^[\w\-.]+\.tar\.gz$/.test(name)) {
         return res.status(400).send('Invalid backup name.');
     }
+
     const fullPath = path.join(BACKUP_DIR, name);
+
     if (!fs.existsSync(fullPath)) {
         return res.status(404).send('Not found.');
     }
-    res.download(fullPath);
+
+    return res.download(fullPath);
 });
 
-
+// Templates
 app.get('/api/templates', requireAuth, (req, res) => {
-    res.json(loadTemplates());
+    return res.json(loadTemplates());
 });
 
-function getLogPath(type) {
-    if (type === 'error') return '/var/log/nginx/error.log';
-    return '/var/log/nginx/access.log';
-}
-
+// Logs
 app.get('/api/logs', requireAuth, (req, res) => {
     const type = req.query.type === 'error' ? 'error' : 'access';
     const lines = parseInt(req.query.lines || '200', 10);
@@ -723,18 +838,18 @@ app.get('/api/logs', requireAuth, (req, res) => {
             console.error(err, stderr.toString());
             return res.status(500).send('Failed to read logs.');
         }
-        res.type('text/plain').send(stdout.toString());
+
+        return res.type('text/plain').send(stdout.toString());
     });
 });
 
+// Current user
 app.get('/api/me', requireAuth, (req, res) => {
-    res.json({
+    return res.json({
         username: req.session.username,
         role: req.session.role
     });
 });
-
-
 
 // ===== start =====
 app.listen(PORT, () => {
